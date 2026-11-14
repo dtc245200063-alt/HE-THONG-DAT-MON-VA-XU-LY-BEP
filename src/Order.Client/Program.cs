@@ -21,7 +21,7 @@ foreach (var item in menu)
 
 // 2. Đường thành công: Tạo đơn đặt món hợp lệ (POST /orders -> 201 Created)
 Console.WriteLine("\n2. Gui yeu cau dat mon hop le:");
-var validRequest = new CreateOrderRequest("Nguyen Van A", MenuItemId: 1, Quantity: 2);
+var validRequest = new CreateOrderRequest("Luong Viet Anh", MenuItemId: 1, Quantity: 2);
 var createdOrder = await SendAndHandleAsync<OrderResponse>(
     () => http.PostAsJsonAsync("/orders", validRequest));
 
