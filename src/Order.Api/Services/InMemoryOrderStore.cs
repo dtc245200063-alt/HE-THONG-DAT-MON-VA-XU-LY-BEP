@@ -10,7 +10,7 @@ public sealed class InMemoryOrderStore
     private readonly List<MenuItemDto> _menu =
     [
         new(1, "Pho Bo Tai Chin", 55000m, true),
-        new(2, "Bun Cha Ha Noi", 50000m, true),
+        new(2, "Bun Cha Ha Hanoi", 50000m, true),
         new(3, "Com Tam Suon Bi", 45000m, true),
         new(4, "Tra Dao Cam Sa", 25000m, false)
     ];
@@ -41,6 +41,20 @@ public sealed class InMemoryOrderStore
         }
 
         return order;
+    }
+
+    public OrderResponse? UpdateOrderStatus(Guid id, string newStatus)
+    {
+        lock (_syncLock)
+        {
+            var index = _orders.FindIndex(o => o.Id == id);
+            if (index < 0) return null;
+
+            var existing = _orders[index];
+            var updated = existing with { Status = newStatus };
+            _orders[index] = updated;
+            return updated;
+        }
     }
 
     public IReadOnlyList<OrderResponse> GetOrders(string? status)

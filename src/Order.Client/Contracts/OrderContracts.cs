@@ -21,6 +21,16 @@ public sealed record OrderResponse(
     DateTimeOffset OrderedAt,
     string Status);
 
+public sealed record UpdateOrderStatusRequest(
+    string Status,
+    string? Note);
+
+public sealed record OrderStatusMessage(
+    Guid OrderId,
+    string Status,
+    string Note,
+    DateTimeOffset UpdatedAt);
+
 public sealed record ApiError(
     string Code,
     string Message);

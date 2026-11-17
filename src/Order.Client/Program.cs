@@ -1,26 +1,65 @@
-﻿using System.Net.Http.Json;
+﻿using System.Net;
+using System.Net.Http.Json;
+using Microsoft.AspNetCore.SignalR.Client;
 using Order.Client.Contracts;
 
-var apiBaseUrl = args.Length > 0 ? args[0] : "http://localhost:5000";
+var apiBaseUrl = args.Length > 0 ? args[0].TrimEnd('/') : "http://localhost:5000";
 
 using var http = new HttpClient
 {
     BaseAddress = new Uri(apiBaseUrl)
 };
 
-Console.WriteLine($"=== KET NOI TOI ORDER API ({apiBaseUrl}) ===\n");
+Console.WriteLine("======================================================================");
+Console.WriteLine($"  HE THONG DAT MON VA XU LY BEP - GIAI DOAN 2: SIGNALR REALTIME");
+Console.WriteLine($"  May khach ket noi toi: {apiBaseUrl}");
+Console.WriteLine("======================================================================\n");
 
-// 1. Xem danh sách món ăn (GET /menu)
+// 1. Thiet lap ket noi SignalR Hub
+Console.WriteLine("1. Khoi tao va thiet lap ket noi SignalR Hub (/hubs/orders)...");
+await using var hubConnection = new HubConnectionBuilder()
+    .WithUrl($"{apiBaseUrl}/hubs/orders")
+    .WithAutomaticReconnect()
+    .Build();
+
+var orderReadyTcs = new TaskCompletionSource<bool>();
+Guid currentWatchingOrderId = Guid.Empty;
+
+// Dang ky callback nhan phan hoi khi dang ky nhom thanh cong
+hubConnection.On<dynamic>("SubscribedToOrder", data =>
+{
+    Console.WriteLine($"   [SignalR HUB] {data}");
+});
+
+// Dang ky callback nhan thong bao khi trang thai don hang thay doi theo thoi gian thuc
+hubConnection.On<OrderStatusMessage>("OrderStatusChanged", message =>
+{
+    Console.WriteLine($"\n   >>> [THONG BAO REALTIME SIGNALR]");
+    Console.WriteLine($"       Ma don     : {message.OrderId}");
+    Console.WriteLine($"       Trang thai : [{message.Status.ToUpper()}]");
+    Console.WriteLine($"       Chi tiet   : {message.Note}");
+    Console.WriteLine($"       Thoi diem  : {message.UpdatedAt:HH:mm:ss dd/MM/yyyy}\n");
+
+    if (message.OrderId == currentWatchingOrderId && message.Status is "Ready" or "Cancelled")
+    {
+        orderReadyTcs.TrySetResult(true);
+    }
+});
+
+await hubConnection.StartAsync();
+Console.WriteLine("   -> Ket noi SignalR thanh cong! San sang nhan thong bao thoi gian thuc.\n");
+
+// 2. Xem danh sach mon an (GET /menu)
+Console.WriteLine("2. Lay thuc don nha hang (GET /menu):");
 var menu = await http.GetFromJsonAsync<List<MenuItemDto>>("/menu") ?? [];
-Console.WriteLine("1. Danh sach mon an:");
 foreach (var item in menu)
 {
     var statusText = item.IsAvailable ? "Con mon" : "Tam het";
     Console.WriteLine($"   - [{item.Id}] {item.Name}: {item.Price:N0} VND ({statusText})");
 }
 
-// 2. Đường thành công: Tạo đơn đặt món hợp lệ (POST /orders -> 201 Created)
-Console.WriteLine("\n2. Gui yeu cau dat mon hop le:");
+// 3. Gui yeu cau dat mon hop le (POST /orders -> 201 Created)
+Console.WriteLine("\n3. Gui yeu cau dat mon hop le:");
 var validRequest = new CreateOrderRequest("Luong Viet Anh", MenuItemId: 1, Quantity: 2);
 var createdOrder = await SendAndHandleAsync<OrderResponse>(
     () => http.PostAsJsonAsync("/orders", validRequest));
@@ -28,34 +67,63 @@ var createdOrder = await SendAndHandleAsync<OrderResponse>(
 if (createdOrder is not null)
 {
     Console.WriteLine($"   -> Dat thanh cong! Ma don: {createdOrder.Id}");
-    Console.WriteLine($"   -> Mon: {createdOrder.MenuItemName} x{createdOrder.Quantity} | Tong: {createdOrder.TotalPrice:N0} VND | Trang thai: {createdOrder.Status}");
+    Console.WriteLine($"   -> Khach: {createdOrder.CustomerName} | Mon: {createdOrder.MenuItemName} x{createdOrder.Quantity}");
+    Console.WriteLine($"   -> Tong tien: {createdOrder.TotalPrice:N0} VND | Trang thai ban dau: [{createdOrder.Status}]");
 
-    // 3. Tra cứu lại chi tiết đơn vừa tạo (GET /orders/{id} -> 200 OK)
-    Console.WriteLine("\n3. Tra cuu chi tiet don vua dat:");
-    var detail = await SendAndHandleAsync<OrderResponse>(
-        () => http.GetAsync($"/orders/{createdOrder.Id}"));
-    if (detail is not null)
+    // 4. Dang ky theo doi trang thai don hang qua SignalR (WatchOrder)
+    currentWatchingOrderId = createdOrder.Id;
+    Console.WriteLine($"\n4. Dang ky nhom theo doi don hang qua SignalR: 'order:{createdOrder.Id}'...");
+    await hubConnection.InvokeAsync("WatchOrder", createdOrder.Id);
+
+    Console.WriteLine("   -> Dang cho bep tiep nhan va che bien (tu dong nhan thong bao realtime)...");
+
+    // Cho tin hieu realtime tu bep (Preparing -> Ready) voi thoi gian cho toi da 12 giay
+    var completedTask = await Task.WhenAny(orderReadyTcs.Task, Task.Delay(12000));
+    if (completedTask == orderReadyTcs.Task)
     {
-        Console.WriteLine($"   -> Khach hang: {detail.CustomerName} | Thoi diem dat: {detail.OrderedAt:HH:mm:ss dd/MM/yyyy} | Trang thai: {detail.Status}");
+        Console.WriteLine("   -> Quy trinh che bien mon da HOAN TAT (Ready) qua kenh SignalR!");
+    }
+    else
+    {
+        Console.WriteLine("   [!] Timeout cho thong bao tu bep.");
+    }
+
+    // 5. Tra cuu lai chi tiet don sau khi bep da xu ly (GET /orders/{id})
+    Console.WriteLine("\n5. Tra cuu lai chi tiet don tren he thong (GET /orders/{id}):");
+    var finalDetail = await SendAndHandleAsync<OrderResponse>(
+        () => http.GetAsync($"/orders/{createdOrder.Id}"));
+    if (finalDetail is not null)
+    {
+        Console.WriteLine($"   -> Ma don: {finalDetail.Id} | Trang thai hien tai: [{finalDetail.Status}]");
     }
 }
 
-// 4. Lọc danh sách đơn theo trạng thái Pending (GET /orders?status=Pending)
-Console.WriteLine("\n4. Danh sach don dang o trang thai Pending:");
-var pendingOrders = await SendAndHandleAsync<List<OrderResponse>>(
-    () => http.GetAsync("/orders?status=Pending")) ?? [];
-Console.WriteLine($"   -> Tim thay {pendingOrders.Count} don hang.");
+// 6. Kiem thu cap nhat thu cong trang thai don tu phia Bep (POST /orders/{id}/status)
+Console.WriteLine("\n6. Kiem thu bep chu dong cap nhat trang thai thu cong va ban SignalR:");
+var order2Request = new CreateOrderRequest("Luong Viet Anh", MenuItemId: 2, Quantity: 1);
+var order2 = await SendAndHandleAsync<OrderResponse>(
+    () => http.PostAsJsonAsync("/orders", order2Request));
 
-// 5. Đường lỗi 400 Bad Request: Đặt món thiếu tên khách hàng
-Console.WriteLine("\n5. Kiem thu duong loi 400 (thieu ten khach hang):");
+if (order2 is not null)
+{
+    await hubConnection.InvokeAsync("WatchOrder", order2.Id);
+    Console.WriteLine($"   -> Don moi #{order2.Id} da tao. Gui yeu cau tu bep huy don vi het nguyen lieu:");
+    var cancelRequest = new UpdateOrderStatusRequest("Cancelled", "Bep bao het nguyen lieu dot xuat.");
+    await SendAndHandleAsync<OrderResponse>(
+        () => http.PostAsJsonAsync($"/orders/{order2.Id}/status", cancelRequest));
+    await Task.Delay(1000);
+}
+
+// 7. Kiem thu cac truong hop loi dau vao (Validation 400 & 404)
+Console.WriteLine("\n7. Kiem thu duong loi HTTP REST (400 Bad Request & 404 Not Found):");
 var invalidRequest = new CreateOrderRequest("", MenuItemId: 1, Quantity: 1);
 await SendAndHandleAsync<OrderResponse>(
     () => http.PostAsJsonAsync("/orders", invalidRequest));
 
-// 6. Đường lỗi 404 Not Found: Tra cứu mã đơn không tồn tại
-Console.WriteLine("\n6. Kiem thu duong loi 404 (ma don khong ton tai):");
 await SendAndHandleAsync<OrderResponse>(
     () => http.GetAsync($"/orders/{Guid.NewGuid()}"));
+
+Console.WriteLine("\n=== HOAN TAT TOAN BO KIEM THU GIAI DOAN 2 (REST + SIGNALR) ===");
 
 static async Task<T?> SendAndHandleAsync<T>(Func<Task<HttpResponseMessage>> sendAsync)
 {

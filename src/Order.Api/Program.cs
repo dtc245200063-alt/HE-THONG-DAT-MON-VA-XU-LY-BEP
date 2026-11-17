@@ -1,24 +1,40 @@
+using Microsoft.AspNetCore.SignalR;
 using Order.Api.Contracts;
+using Order.Api.Hubs;
 using Order.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<InMemoryOrderStore>();
+builder.Services.AddSignalR();
+
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials()
+              .SetIsOriginAllowed(_ => true);
+    });
+});
 
 var app = builder.Build();
+app.UseCors();
 
 // 1. Kiểm tra trạng thái API
 app.MapGet("/", () => Results.Ok(new
 {
     service = "Order.Api",
-    status = "running"
+    status = "running",
+    realtime = "SignalR enabled at /hubs/orders"
 }));
 
 // 2. Lấy danh sách món ăn
 app.MapGet("/menu", (InMemoryOrderStore store) =>
     Results.Ok(store.GetMenu()));
 
-// 3. Tạo đơn đặt món mới
-app.MapPost("/orders", (CreateOrderRequest request, InMemoryOrderStore store) =>
+// 3. Tạo đơn đặt món mới (REST) + Tự động mô phỏng bếp chế biến & phát sự kiện thời gian thực (SignalR)
+app.MapPost("/orders", (CreateOrderRequest request, InMemoryOrderStore store, IHubContext<OrderHub> hubContext) =>
 {
     if (string.IsNullOrWhiteSpace(request.CustomerName))
     {
@@ -50,6 +66,11 @@ app.MapPost("/orders", (CreateOrderRequest request, InMemoryOrderStore store) =>
     }
 
     var createdOrder = store.CreateOrder(request.CustomerName, menuItem, request.Quantity);
+
+    // Kích hoạt tiến trình mô phỏng bếp tiếp nhận & chế biến bất đồng bộ,
+    // phát thông báo cập nhật trạng thái (Preparing -> Ready) qua SignalR Hub
+    _ = SimulateKitchenProcessingAsync(createdOrder.Id, store, hubContext);
+
     return Results.Created($"/orders/{createdOrder.Id}", createdOrder);
 });
 
@@ -81,4 +102,74 @@ app.MapGet("/orders/{id:guid}", (Guid id, InMemoryOrderStore store) =>
     return Results.Ok(order);
 });
 
+// 6. Cập nhật thủ công trạng thái đơn hàng (Dành cho bộ phận Bếp / Quản trị viên)
+app.MapPost("/orders/{id:guid}/status", async (Guid id, UpdateOrderStatusRequest request, InMemoryOrderStore store, IHubContext<OrderHub> hubContext) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Status) ||
+        !InMemoryOrderStore.ValidStatuses.Contains(request.Status.Trim(), StringComparer.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest(new ApiError(
+            "INVALID_STATUS",
+            $"Trang thai khong hop le. Cac gia tri ho tro: {string.Join(", ", InMemoryOrderStore.ValidStatuses)}."));
+    }
+
+    var updatedOrder = store.UpdateOrderStatus(id, request.Status.Trim());
+    if (updatedOrder is null)
+    {
+        return Results.NotFound(new ApiError(
+            "ORDER_NOT_FOUND",
+            $"Khong tim thay don hang voi ma {id}."));
+    }
+
+    var note = request.Note ?? $"Trang thai don hang da chuyen sang {updatedOrder.Status}.";
+    var statusMessage = new OrderStatusMessage(
+        OrderId: id,
+        Status: updatedOrder.Status,
+        Note: note,
+        UpdatedAt: DateTimeOffset.UtcNow);
+
+    // Bắn thông báo thời gian thực tới nhóm theo dõi đơn hàng này
+    await hubContext.Clients.Group(OrderHub.GetOrderGroupName(id))
+        .SendAsync("OrderStatusChanged", statusMessage);
+
+    return Results.Ok(updatedOrder);
+});
+
+// 7. Ánh xạ SignalR Hub
+app.MapHub<OrderHub>("/hubs/orders");
+
 app.Run();
+
+// Hàm mô phỏng bếp chế biến món và phát sự kiện realtime qua SignalR Hub
+// (Tham chiếu Giáo trình Chương 3, Mục 3.3, Mã nguồn 3.3)
+static async Task SimulateKitchenProcessingAsync(
+    Guid orderId,
+    InMemoryOrderStore store,
+    IHubContext<OrderHub> hubContext)
+{
+    // Bước 1: Sau 2 giây, bếp tiếp nhận đơn và chuyển sang trạng thái "Preparing"
+    await Task.Delay(2000);
+    var preparingOrder = store.UpdateOrderStatus(orderId, "Preparing");
+    if (preparingOrder is not null)
+    {
+        await hubContext.Clients.Group(OrderHub.GetOrderGroupName(orderId))
+            .SendAsync("OrderStatusChanged", new OrderStatusMessage(
+                OrderId: orderId,
+                Status: "Preparing",
+                Note: $"Dau bep dang che bien mon '{preparingOrder.MenuItemName}' (x{preparingOrder.Quantity}).",
+                UpdatedAt: DateTimeOffset.UtcNow));
+    }
+
+    // Bước 2: Sau 3 giây tiếp theo, món ăn hoàn thành và chuyển sang trạng thái "Ready"
+    await Task.Delay(3000);
+    var readyOrder = store.UpdateOrderStatus(orderId, "Ready");
+    if (readyOrder is not null)
+    {
+        await hubContext.Clients.Group(OrderHub.GetOrderGroupName(orderId))
+            .SendAsync("OrderStatusChanged", new OrderStatusMessage(
+                OrderId: orderId,
+                Status: "Ready",
+                Note: $"Mon '{readyOrder.MenuItemName}' da che bien xong! Xin moi khach hang nhan mon.",
+                UpdatedAt: DateTimeOffset.UtcNow));
+    }
+}
